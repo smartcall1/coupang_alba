@@ -47,18 +47,43 @@ function fmt(n) {
 }
 
 // ─── API 호출 ─────────────────────────────────────────────────────────────────
-async function fetchOrders(date) {
-    const method  = 'GET';
-    const apiPath = '/v2/providers/affiliate_open_api/apis/openapi/v1/report/orders';
-    const query   = `startDate=${date}&endDate=${date}`;
-    const auth    = generateHmac(method, `${apiPath}?${query}`, SECRET_KEY, ACCESS_KEY);
+// 쿠팡 파트너스 리포트 API 엔드포인트 후보 (공식 문서 미공개 → 검증 필요)
+const REPORT_ENDPOINTS = [
+    '/v2/providers/affiliate_open_api/apis/openapi/v1/report/revenue',
+    '/v2/providers/affiliate_open_api/apis/openapi/v1/report/income',
+    '/v2/providers/affiliate_open_api/apis/openapi/v1/report/daily',
+    '/v2/providers/affiliate_open_api/apis/openapi/v1/revenue',
+    '/v2/providers/affiliate_open_api/apis/openapi/v1/report',
+];
 
-    const res = await axios.get(`${DOMAIN}${apiPath}`, {
+async function callApi(apiPath, date) {
+    const method = 'GET';
+    const query  = `startDate=${date}&endDate=${date}`;
+    const auth   = generateHmac(method, `${apiPath}?${query}`, SECRET_KEY, ACCESS_KEY);
+    const res    = await axios.get(`${DOMAIN}${apiPath}`, {
         params:  { startDate: date, endDate: date },
         headers: { Authorization: auth },
         timeout: 15000,
     });
     return res.data;
+}
+
+async function fetchOrders(date) {
+    return callApi(REPORT_ENDPOINTS[0], date);
+}
+
+// --test 모드에서 후보 엔드포인트 전체 탐색
+async function probeEndpoints(date) {
+    for (const ep of REPORT_ENDPOINTS) {
+        process.stdout.write(`\n🔍 시도: ${ep}\n`);
+        try {
+            const data = await callApi(ep, date);
+            console.log('✅ 응답:\n' + JSON.stringify(data, null, 2));
+        } catch (e) {
+            const msg = e.response?.data ? JSON.stringify(e.response.data) : e.message;
+            console.log('❌ ' + msg);
+        }
+    }
 }
 
 // ─── 카테고리 추론 ────────────────────────────────────────────────────────────
@@ -226,13 +251,8 @@ async function main() {
     await clearCommands();
 
     if (isTest) {
-        console.log('[TEST] API raw 응답 덤프\n');
-        try {
-            const raw = await fetchOrders(date);
-            console.log(JSON.stringify(raw, null, 2));
-        } catch (e) {
-            console.error('API 오류:', e.response?.data || e.message);
-        }
+        console.log('[TEST] 후보 엔드포인트 전체 탐색\n');
+        await probeEndpoints(date);
         return;
     }
 
