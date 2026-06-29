@@ -78,32 +78,24 @@ async function fetchSummary(date) {
 }
 
 async function fetchProducts(date) {
-    const allRows = [];
-    let pageNumber = 0;
+    const PAGE_SIZE = 100;
+    const allRows   = [];
+    let pageNumber  = 0;
+    let totalItems  = null;
 
     while (true) {
         const res = await axios.post(
             `${BASE}/api/v1/performance/product`,
-            {
-                filters: dateFilter(date),
-                page: { size: 100, pageNumber },
-                sorts: [],
-            },
+            { filters: dateFilter(date), page: { size: PAGE_SIZE, pageNumber }, sorts: [] },
             { headers: makeHeaders(), timeout: 15000 }
         );
 
-        const data = res.data;
-        // 응답 구조 미확정 — --test 로 확인 후 조정
-        const rows = data?.data?.content
-                  || data?.content
-                  || data?.data
-                  || (Array.isArray(data) ? data : []);
-
+        const rows = res.data?.data?.content || [];
         if (!rows.length) break;
         allRows.push(...rows);
 
-        const totalPages = data?.data?.totalPages ?? data?.totalPages ?? 1;
-        if (pageNumber + 1 >= totalPages) break;
+        if (totalItems === null) totalItems = res.data?.data?.total ?? rows.length;
+        if (allRows.length >= totalItems) break;
         pageNumber++;
     }
 
@@ -124,6 +116,21 @@ const CATEGORIES = [
     { keys: ['세제','칫솔','치약','샴푸','바디워시','수건','주방','생활'], emoji: '🧴', label: '생활용품' },
 ];
 
+// API가 category 문자열을 직접 제공 → 이모지 매핑
+const CAT_EMOJI_MAP = {
+    '식품': '🍱', '로켓프레시': '🥦', '생활용품': '🧴', '가전': '🏠',
+    '전자제품': '💻', '뷰티': '💄', '건강식품': '💊', '패션의류': '👗',
+    '스포츠': '⚽', '반려동물': '🐾', '도서': '📚', '완구': '🎮',
+    '주방': '🍳', '자동차': '🚗', '여행': '✈️',
+};
+
+function categoryEmoji(cat) {
+    for (const [key, emoji] of Object.entries(CAT_EMOJI_MAP)) {
+        if (cat.includes(key)) return emoji;
+    }
+    return '🛍️';
+}
+
 function guessCategory(name) {
     for (const cat of CATEGORIES) {
         if (cat.keys.some(k => name.includes(k))) return cat;
@@ -135,69 +142,47 @@ function guessCategory(name) {
 function parseProducts(rows) {
     const productMap  = {};
     const categoryMap = {};
-    const channelMap  = {};
-    const fullCancels = [];
 
     for (const row of rows) {
-        // --test로 덤프한 실제 필드명으로 아래 key들 확정 필요
-        const rev       = Number(row.commission       || row.revenue        || row.수익     || 0);
-        const sale      = Number(row.orderPrice       || row.sales          || row.매출액   || 0);
-        const qty       = Number(row.orderCount       || row.quantity       || row.판매수량 || 0);
-        const cancelRev = Number(row.cancelCommission || row.cancelRevenue  || row.취소수익 || 0);
-        const cancelQty = Number(row.cancelCount      || row.cancelQuantity || row.취소수량 || 0);
-        const rawCh     = row.subId || row.channelId  || row.채널ID          || '';
-        const chKey     = rawCh.trim() || '📌기본(채널없음)';
-        const pName     = row.productName || row.상품명 || row.name          || '(상품명 없음)';
-        const pId       = String(row.productId || row.상품ID || row.id || pName);
-        const apiCat    = row.categoryName || row.category || null;
-        const cat       = apiCat ? { emoji: '🏷️', label: apiCat } : guessCategory(pName);
-        const netRev    = rev - cancelRev;
+        const rev    = Number(row.commission || 0);
+        const sale   = Number(row.gmv        || 0);
+        const qty    = Number(row.quantity   || 0);
+        const pName  = row.product    || '(상품명 없음)';
+        const pId    = String(row.productId || pName);
+        const cat    = row.category   ? { emoji: categoryEmoji(row.category), label: row.category }
+                                      : guessCategory(pName);
 
         if (!productMap[pId])          productMap[pId]          = { name: pName, revenue: 0, qty: 0 };
-        productMap[pId].revenue       += netRev;
+        productMap[pId].revenue       += rev;
         productMap[pId].qty           += qty;
 
-        if (!channelMap[chKey])        channelMap[chKey]        = { revenue: 0, orders: 0 };
-        channelMap[chKey].revenue     += netRev;
-        channelMap[chKey].orders      += qty;
-
         if (!categoryMap[cat.label])   categoryMap[cat.label]   = { emoji: cat.emoji, revenue: 0, orders: 0 };
-        categoryMap[cat.label].revenue += netRev;
+        categoryMap[cat.label].revenue += rev;
         categoryMap[cat.label].orders  += qty;
-
-        if (cancelQty > 0 && qty === cancelQty) {
-            fullCancels.push(`• ${pName} ${cancelQty}건`);
-        }
     }
 
     return {
         top5: Object.values(productMap).sort((a, b) => b.revenue - a.revenue).slice(0, 5),
-        channelLines: Object.entries(channelMap)
-            .sort(([, a], [, b]) => b.revenue - a.revenue)
-            .map(([ch, v]) => `• ${ch}  ₩${fmt(v.revenue)} (${v.orders}건)`),
         categoryLines: Object.entries(categoryMap)
             .sort(([, a], [, b]) => b.revenue - a.revenue)
             .map(([label, v]) => `${v.emoji} ${label}  ₩${fmt(v.revenue)} (${v.orders}건)`),
-        fullCancels,
     };
 }
 
 function parseSummary(data) {
-    // --test로 실제 필드명 확인 후 조정
     const d = data?.data || data;
     return {
-        revenue   : Number(d?.totalCommission || d?.revenue      || d?.commission   || d?.수익     || 0),
-        sales     : Number(d?.totalOrderPrice || d?.totalSales   || d?.sales        || d?.매출액   || 0),
-        orders    : Number(d?.totalOrderCount || d?.orders       || d?.orderCount   || d?.구매건수  || 0),
-        clicks    : Number(d?.totalClicks     || d?.clicks       || d?.clickCount   || d?.클릭수   || 0),
-        convRate  : (d?.conversionRate        || d?.convertRate  || d?.전환율        || null),
+        revenue  : Number(d?.commission  || 0),
+        sales    : Number(d?.gmv         || 0),
+        orders   : Number(d?.orderCount  || 0),
+        clicks   : Number(d?.clickCount  || 0),
+        convRate : d?.conversion != null ? (d.conversion * 100).toFixed(2) : null,
     };
 }
 
 // ─── 메시지 포맷 ──────────────────────────────────────────────────────────────
 function buildMessage(date, sum, prod) {
-    const convRate = sum.convRate != null
-        ? `${Number(sum.convRate).toFixed(2)}%`
+    const convRate = sum.convRate != null ? `${sum.convRate}%`
         : (sum.clicks > 0 ? `${((sum.orders / sum.clicks) * 100).toFixed(2)}%` : '-');
 
     const L = [
@@ -221,17 +206,7 @@ function buildMessage(date, sum, prod) {
 
     if (prod.categoryLines.length > 0) {
         L.push(``, `─────────────────────`, `📂 카테고리별 수익`);
-        L.push(...prod.categoryLines.slice(0, 8));
-    }
-
-    if (prod.fullCancels.length > 0) {
-        L.push(``, `─────────────────────`, `⚠️ 전량취소 상품`);
-        L.push(...prod.fullCancels.slice(0, 5));
-    }
-
-    if (prod.channelLines.length > 0) {
-        L.push(``, `─────────────────────`, `📡 채널별 실적`);
-        L.push(...prod.channelLines.slice(0, 10));
+        L.push(...prod.categoryLines.slice(0, 10));
     }
 
     L.push(``, `─────────────────────`, `🕐 조회: ${nowKST()}`);
@@ -297,18 +272,17 @@ async function main() {
         console.log(`[${t} KST] 시도 ${attempt}/${MAX_ATTEMPTS}...`);
 
         try {
-            const [summaryRaw, productRows] = await Promise.all([
-                fetchSummary(date),
-                fetchProducts(date),
-            ]);
-
-            const sum  = parseSummary(summaryRaw);
+            const summaryRaw = await fetchSummary(date);
+            const sum = parseSummary(summaryRaw);
             console.log(`   📊 수익:₩${fmt(sum.revenue)} 건수:${sum.orders} 매출:₩${fmt(sum.sales)} 클릭:${sum.clicks}`);
 
             const done = sum.revenue > 0 && sum.orders > 0 && sum.sales > 0;
             if (!done) {
                 console.log('   ⏳ 집계 중. 10분 후 재시도...');
             } else {
+                console.log('   📦 상품 데이터 수집 중...');
+                const productRows = await fetchProducts(date);
+                console.log(`   ✅ ${productRows.length}개 상품 수집 완료`);
                 const prod = parseProducts(productRows);
                 await sendTelegram(buildMessage(date, sum, prod));
                 break;
