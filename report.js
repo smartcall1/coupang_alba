@@ -14,30 +14,76 @@
  *   TELEGRAM_CHAT_ID=...
  */
 
+const fs = require('fs');
+const path = require('path');
 require('dotenv').config();
 const axios = require('axios');
 
-const SID    = process.env.COUPANG_COOKIE_SID;
-const CT_AT  = process.env.COUPANG_COOKIE_CT_AT;
-const AFATK  = process.env.COUPANG_COOKIE_AFATK;
+let SID     = process.env.COUPANG_COOKIE_SID;
+let CT_AT   = process.env.COUPANG_COOKIE_CT_AT;
+let AFATK   = process.env.COUPANG_COOKIE_AFATK;
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID   = process.env.TELEGRAM_CHAT_ID;
 
-const BASE    = 'https://partners.coupang.com';
-const POLL_MS = 10 * 60 * 1000;
+const BASE     = 'https://partners.coupang.com';
+const POLL_MS  = 10 * 60 * 1000;
 const MAX_ATTEMPTS = 42;
+const ENV_PATH = path.join(__dirname, '.env');
+
+// ─── CT_AT 만료 확인 ─────────────────────────────────────────────────────────
+function getCTATExpiry() {
+    try {
+        const payload = JSON.parse(Buffer.from(CT_AT.split('.')[1], 'base64').toString());
+        return payload.exp * 1000;
+    } catch { return 0; }
+}
+
+function isCTATExpired() {
+    return Date.now() > getCTATExpiry() - 60000; // 1분 여유
+}
+
+// ─── sid 자동 갱신 (postlogin → 5일 연장) ────────────────────────────────────
+async function refreshSid() {
+    try {
+        const res = await axios.get(`${BASE}/api/v1/postlogin`, {
+            headers: {
+                'Cookie': `sid=${SID}; AFATK=${AFATK}`,
+                'User-Agent': 'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36',
+            },
+            maxRedirects: 0,
+            validateStatus: s => s === 302,
+            timeout: 10000,
+        });
+
+        const setCookies = res.headers['set-cookie'] || [];
+        let newSid = null, newAfatk = null;
+        for (const c of setCookies) {
+            const sidM   = c.match(/^sid=([^;]+)/);
+            const afatkM = c.match(/^AFATK=([^;]+)/);
+            if (sidM)   newSid   = sidM[1];
+            if (afatkM) newAfatk = afatkM[1];
+        }
+
+        if (newSid) {
+            SID   = newSid;
+            AFATK = newAfatk || AFATK;
+            // .env 파일 자동 업데이트
+            let envContent = fs.readFileSync(ENV_PATH, 'utf8');
+            envContent = envContent.replace(/^COUPANG_COOKIE_SID=.*/m,   `COUPANG_COOKIE_SID=${SID}`);
+            envContent = envContent.replace(/^COUPANG_COOKIE_AFATK=.*/m, `COUPANG_COOKIE_AFATK=${AFATK}`);
+            fs.writeFileSync(ENV_PATH, envContent);
+            console.log('🔄 sid 자동 갱신 완료 (5일 연장)');
+        }
+    } catch (e) {
+        console.warn('⚠️ sid 갱신 실패 (무시):', e.message);
+    }
+}
 
 // ─── 공통 헤더 ────────────────────────────────────────────────────────────────
 function makeHeaders() {
-    const cookie = [
-        `sid=${SID}`,
-        `CT_AT=${CT_AT}`,
-        `AFATK=${AFATK}`,
-    ].join('; ');
-
     return {
         'Content-Type': 'application/json',
-        'Cookie': cookie,
+        'Cookie': `sid=${SID}; CT_AT=${CT_AT}; AFATK=${AFATK}`,
         'Origin': BASE,
         'Referer': `${BASE}/`,
         'User-Agent': 'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36',
@@ -248,6 +294,20 @@ async function main() {
 
     console.log(`[쿠팡 리포트] 대상 날짜: ${date}`);
     await clearCommands();
+
+    // sid 자동 갱신 (5일 유효 → 매 실행마다 연장)
+    await refreshSid();
+
+    // CT_AT 만료 확인
+    if (isCTATExpired()) {
+        const msg = `⚠️ <b>쿠팡 쿠키 만료</b>\nCT_AT가 만료됐소.\n\nChrome → F12 → Application → Cookies → partners.coupang.com\n→ CT_AT 값 복사 → .env 업데이트 후 재실행\n\n🕐 ${nowKST()}`;
+        await sendTelegram(msg);
+        console.error('❌ CT_AT 만료. 텔레그램 알림 발송 후 종료.');
+        process.exit(1);
+    }
+
+    const expiry = new Date(getCTATExpiry()).toISOString().slice(11, 16);
+    console.log(`🔑 CT_AT 유효 (만료: ${expiry} UTC)`);
 
     if (isTest) {
         console.log('\n[TEST] summary 응답:');
